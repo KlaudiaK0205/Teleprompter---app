@@ -8,12 +8,6 @@ import AVFoundation
 
 @main
 struct TeleprompterApp: App {
-    init() {
-        // PiP wymaga sesji audio .playback; mixWithOthers nie przerywa muzyki ani nagrywania.
-        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback, options: .mixWithOthers)
-        try? AVAudioSession.sharedInstance().setActive(true)
-    }
-
     var body: some Scene {
         WindowGroup { ContentView() }
     }
@@ -42,9 +36,12 @@ final class Prompter: NSObject, ObservableObject, AVPictureInPictureSampleBuffer
     private var offset = 0.0
     private var last = CACurrentMediaTime()
     private var pool: CVPixelBufferPool?
+    private let engine = AVAudioEngine()
+    private let silence = AVAudioPlayerNode()
 
     override init() {
         super.init()
+        setUpSilence()
         displayLayer.videoGravity = .resizeAspect
         if AVPictureInPictureController.isPictureInPictureSupported() {
             pip = AVPictureInPictureController(contentSource: .init(sampleBufferDisplayLayer: displayLayer, playbackDelegate: self))
@@ -54,6 +51,32 @@ final class Prompter: NSObject, ObservableObject, AVPictureInPictureSampleBuffer
         // Timer, nie CADisplayLink: działa też w tle, gdy PiP jest aktywne.
         let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(timer, forMode: .common)
+    }
+
+    // iOS usypia aplikację w tle, gdy inna (np. TikTok) zabierze dźwięk — wtedy PiP zamarza.
+    // Grająca w pętli cisza, zmiksowana z innymi, utrzymuje aplikację przy życiu,
+    // nie przerywa dźwięku TikToka i nie trafia do nagrania.
+    private func setUpSilence() {
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback, options: .mixWithOthers)
+        let format = engine.mainMixerNode.outputFormat(forBus: 0)
+        engine.attach(silence)
+        engine.connect(silence, to: engine.mainMixerNode, format: format)
+        silence.volume = 0
+        if let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(format.sampleRate)) {
+            buffer.frameLength = buffer.frameCapacity
+            silence.scheduleBuffer(buffer, at: nil, options: .loops)
+        }
+        let center = NotificationCenter.default
+        for name in [AVAudioSession.interruptionNotification, .AVAudioEngineConfigurationChange] {
+            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.startSilence() }
+        }
+        startSilence()
+    }
+
+    private func startSilence() {
+        try? AVAudioSession.sharedInstance().setActive(true)
+        if !engine.isRunning { try? engine.start() }
+        if engine.isRunning && !silence.isPlaying { silence.play() }
     }
 
     private var maxOffset: Double { Double((page?.height ?? Self.height) - Self.height) }
@@ -157,6 +180,7 @@ final class Prompter: NSObject, ObservableObject, AVPictureInPictureSampleBuffer
     // MARK: przyciski w oknie PiP
 
     func pictureInPictureController(_ c: AVPictureInPictureController, setPlaying playing: Bool) {
+        if playing { startSilence() }
         isPlaying = playing
     }
 
