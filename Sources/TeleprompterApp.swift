@@ -2,6 +2,7 @@ import SwiftUI
 import AVKit
 import AVFoundation
 import Speech
+import UniformTypeIdentifiers
 
 // iOS nie pozwala na nakładki systemowe. Jedyne okno, które pływa nad innymi
 // aplikacjami (aparat, Instagram, TikTok…), to Obraz w Obrazie (PiP).
@@ -286,11 +287,38 @@ final class Prompter: NSObject, ObservableObject {
     }
 }
 
+struct Script: Codable, Equatable {
+    var text: String
+    var file: String? = nil // nazwa pliku w folderze z iCloud Drive, jeśli skrypt stamtąd pochodzi
+
+    // Nazwa: plik bez rozszerzenia albo pierwsza niepusta linijka.
+    var title: String {
+        if let file { return (file as NSString).deletingPathExtension }
+        let line = text.split(whereSeparator: \.isNewline).first { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        return line.map { String($0.prefix(40)) } ?? "Nowy skrypt"
+    }
+
+    // Do wyświetlenia: z .md zdejmujemy nagłówki (# ) i znaczniki (**pogrubienia**, [linki](…)).
+    var plain: String {
+        guard file?.lowercased().hasSuffix(".md") == true else { return text }
+        return text.components(separatedBy: .newlines).map { line in
+            var l = Substring(line)
+            let hashes = l.prefix { $0 == "#" }.count
+            if (1...6).contains(hashes), l.dropFirst(hashes).first == " " { l = l.dropFirst(hashes + 1) } // #hashtagi zostają
+            let md = try? AttributedString(markdown: String(l), options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))
+            return md.map { String($0.characters) } ?? String(l)
+        }.joined(separator: "\n")
+    }
+}
+
 struct ContentView: View {
     @StateObject private var prompter = Prompter()
     @State private var scripts = Self.loadScripts()
     @AppStorage("current") private var current = 0
     @State private var confirmDelete = false
+    @State private var folder: URL? = Self.resolveFolder()
+    @State private var pickFolder = false
+    @Environment(\.scenePhase) private var phase
     @AppStorage("fontSize") private var fontSize = 48.0
     @AppStorage("speed") private var speed = 50.0
     @AppStorage("windowHeight") private var windowHeight = 450.0
@@ -299,19 +327,71 @@ struct ContentView: View {
 
     // Zawsze jest co najmniej jeden skrypt (ostatniego nie da się usunąć).
     private var index: Int { min(max(current, 0), scripts.count - 1) }
-    private var text: Binding<String> { Binding(get: { scripts[index] }, set: { scripts[index] = $0 }) }
-
-    private static func loadScripts() -> [String] {
-        if let data = UserDefaults.standard.data(forKey: "scripts"),
-           let saved = try? JSONDecoder().decode([String].self, from: data), !saved.isEmpty { return saved }
-        // Pierwsze uruchomienie albo tekst z wersji sprzed listy skryptów.
-        return [UserDefaults.standard.string(forKey: "script") ?? "Wklej tutaj swój tekst.\n\nNaciśnij „Pływające okno”, a potem przejdź do aparatu lub dowolnej innej aplikacji — tekst zostanie na wierzchu."]
+    private var text: Binding<String> {
+        Binding(get: { scripts[index].text }, set: {
+            scripts[index].text = $0
+            // Zmiany w skrypcie z folderu wracają do pliku, więc widać je też na komputerze.
+            if let file = scripts[index].file, let folder {
+                try? $0.write(to: folder.appendingPathComponent(file), atomically: true, encoding: .utf8)
+            }
+        })
     }
 
-    // Nazwa skryptu = jego pierwsza niepusta linijka.
-    private static func title(_ script: String) -> String {
-        let line = script.split(whereSeparator: \.isNewline).first { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-        return line.map { String($0.prefix(40)) } ?? "Nowy skrypt"
+    private static func loadScripts() -> [Script] {
+        let data = UserDefaults.standard.data(forKey: "scripts") ?? Data()
+        if let saved = try? JSONDecoder().decode([Script].self, from: data), !saved.isEmpty { return saved }
+        if let old = try? JSONDecoder().decode([String].self, from: data), !old.isEmpty { return old.map { Script(text: $0) } }
+        // Pierwsze uruchomienie albo tekst z wersji sprzed listy skryptów.
+        return [Script(text: UserDefaults.standard.string(forKey: "script") ?? "Wklej tutaj swój tekst.\n\nNaciśnij „Pływające okno”, a potem przejdź do aparatu lub dowolnej innej aplikacji — tekst zostanie na wierzchu.")]
+    }
+
+    // MARK: - Folder w iCloud Drive (pliki .txt i .md z komputera)
+
+    private static func resolveFolder() -> URL? {
+        guard let data = UserDefaults.standard.data(forKey: "folder") else { return nil }
+        var stale = false
+        guard let url = try? URL(resolvingBookmarkData: data, bookmarkDataIsStale: &stale) else { return nil }
+        _ = url.startAccessingSecurityScopedResource() // dostęp na cały czas działania aplikacji
+        if stale, let fresh = try? url.bookmarkData() { UserDefaults.standard.set(fresh, forKey: "folder") }
+        return url
+    }
+
+    private func setFolder(_ url: URL) {
+        _ = url.startAccessingSecurityScopedResource()
+        UserDefaults.standard.set(try? url.bookmarkData(), forKey: "folder")
+        folder = url
+        syncFolder()
+    }
+
+    // Nowe pliki dopisujemy do listy, zmienione aktualizujemy. Usunięte z folderu zostają w aplikacji.
+    private func syncFolder(retries: Int = 5) {
+        guard let folder, let urls = try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else { return }
+        var downloading = false
+        for url in urls {
+            var name = url.lastPathComponent
+            if name.hasPrefix("."), name.hasSuffix(".icloud") { name = String(name.dropFirst().dropLast(7)) } // jeszcze nie pobrany
+            guard ["txt", "md"].contains((name as NSString).pathExtension.lowercased()) else { continue }
+            guard name == url.lastPathComponent, let text = Self.read(url) else {
+                try? FileManager.default.startDownloadingUbiquitousItem(at: folder.appendingPathComponent(name))
+                downloading = true
+                continue
+            }
+            if let i = scripts.firstIndex(where: { $0.file == name }) {
+                if scripts[i].text != text { scripts[i].text = text }
+            } else {
+                scripts.append(Script(text: text, file: name))
+            }
+        }
+        if downloading && retries > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { syncFolder(retries: retries - 1) }
+        }
+    }
+
+    // Notatnik zapisuje w UTF-8 (czasem z BOM), starsze pliki bywają w Windows-1250.
+    private static func read(_ url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .windowsCP1250)
+        return text?.replacingOccurrences(of: "\u{FEFF}", with: "")
     }
 
     var body: some View {
@@ -343,27 +423,39 @@ struct ContentView: View {
             HStack {
                 Menu {
                     Picker("Skrypt", selection: $current) {
-                        ForEach(scripts.indices, id: \.self) { Text(Self.title(scripts[$0])).tag($0) }
+                        ForEach(scripts.indices, id: \.self) {
+                            Label(scripts[$0].title, systemImage: scripts[$0].file == nil ? "doc.text" : "icloud").tag($0)
+                        }
                     }
                     Divider()
                     Button("Nowy skrypt", systemImage: "plus") {
-                        scripts.append("")
+                        scripts.append(Script(text: ""))
                         current = scripts.count - 1
                         editing = true
                     }
                     Button("Usuń ten skrypt", systemImage: "trash", role: .destructive) { confirmDelete = true }
                         .disabled(scripts.count < 2)
+                    Divider()
+                    if folder != nil {
+                        Button("Odśwież z folderu", systemImage: "arrow.clockwise") { syncFolder() }
+                    }
+                    Button(folder == nil ? "Połącz folder z iCloud" : "Zmień folder", systemImage: "folder") { pickFolder = true }
                 } label: {
-                    Label(Self.title(scripts[index]), systemImage: "doc.text").lineLimit(1)
+                    Label(scripts[index].title, systemImage: scripts[index].file == nil ? "doc.text" : "icloud").lineLimit(1)
                 }
                 Spacer()
             }
-            .confirmationDialog("Usunąć „\(Self.title(scripts[index]))”?", isPresented: $confirmDelete, titleVisibility: .visible) {
+            .confirmationDialog("Usunąć „\(scripts[index].title)”?", isPresented: $confirmDelete, titleVisibility: .visible) {
                 Button("Usuń", role: .destructive) {
                     let i = index
                     current = max(0, i - 1)
                     scripts.remove(at: i)
                 }
+            } message: {
+                if scripts[index].file != nil { Text("Plik zostaje w iCloud i wróci przy odświeżeniu, jeśli nie usuniesz go z folderu.") }
+            }
+            .fileImporter(isPresented: $pickFolder, allowedContentTypes: [.folder]) { result in
+                if case .success(let url) = result { setFolder(url) }
             }
 
             TextEditor(text: text)
@@ -382,17 +474,19 @@ struct ContentView: View {
             prompter.speed = speed
             prompter.followVoice = followVoice
             prompter.setWindowHeight(windowHeight)
-            prompter.setText(scripts[index], fontSize: fontSize)
+            prompter.setText(scripts[index].plain, fontSize: fontSize)
+            syncFolder()
         }
+        .onChange(of: phase) { if phase == .active { syncFolder() } } // powrót do aplikacji = świeże pliki z komputera
         .onChange(of: scripts) {
             UserDefaults.standard.set(try? JSONEncoder().encode(scripts), forKey: "scripts")
-            prompter.setText(scripts[index], fontSize: fontSize)
+            prompter.setText(scripts[index].plain, fontSize: fontSize)
         }
         .onChange(of: current) {
             prompter.rewind()
-            prompter.setText(scripts[index], fontSize: fontSize)
+            prompter.setText(scripts[index].plain, fontSize: fontSize)
         }
-        .onChange(of: fontSize) { prompter.setText(scripts[index], fontSize: fontSize) }
+        .onChange(of: fontSize) { prompter.setText(scripts[index].plain, fontSize: fontSize) }
         .onChange(of: speed) { prompter.speed = speed }
         .onChange(of: windowHeight) { prompter.setWindowHeight(windowHeight) }
         .onChange(of: followVoice) { prompter.followVoice = followVoice }
