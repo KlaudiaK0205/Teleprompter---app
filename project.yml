@@ -15,7 +15,8 @@ targets:
         UILaunchScreen: {}
         UIBackgroundModes: [audio] # „Audio, AirPlay i Obraz w Obrazie” — wymagane przez PiP
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
-        NSMicrophoneUsageDescription: Pływające okno działa jak okno rozmowy wideo, żeby iOS nie chował go nad aparatem. Nic nie jest nagrywane.
+        NSMicrophoneUsageDescription: Mikrofon słucha, co czytasz, i przesuwa tekst (tryb „Przewijaj za głosem”). Dźwięk nie jest zapisywany.
+        NSSpeechRecognitionUsageDescription: Rozpoznawanie mowy pozwala przesuwać tekst w tempie Twojego czytania.
     settings:
       base:
         SWIFT_VERSION: "5.0"

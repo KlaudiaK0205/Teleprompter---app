@@ -1,6 +1,7 @@
 import SwiftUI
 import AVKit
 import AVFoundation
+import Speech
 
 // iOS nie pozwala na nakładki systemowe. Jedyne okno, które pływa nad innymi
 // aplikacjami (aparat, Instagram, TikTok…), to Obraz w Obrazie (PiP).
@@ -15,20 +16,24 @@ struct TeleprompterApp: App {
     }
 }
 
-// Tekst rysowany w stałej skali 800×450 i powiększany/zmniejszany do rozmiaru okna.
+// Tekst rysowany w stałej szerokości 800 i powiększany/zmniejszany do rozmiaru okna.
 final class TextView: UIView {
-    static let size = CGSize(width: 800, height: 450)
+    static let width: CGFloat = 800, pad: CGFloat = 32
     let label = UILabel()
     private let stage = UIView()
 
     var offset: CGFloat = 0 { didSet { setNeedsLayout() } }
+    var stageHeight: CGFloat = 450 {
+        didSet { stage.bounds.size.height = stageHeight; setNeedsLayout() }
+    }
+    var readingLine: CGFloat { stageHeight * 0.35 } // tu stoi czytana linijka
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .black
         clipsToBounds = true
         label.numberOfLines = 0
-        stage.bounds = CGRect(origin: .zero, size: Self.size)
+        stage.bounds = CGRect(x: 0, y: 0, width: Self.width, height: stageHeight)
         stage.addSubview(label)
         addSubview(stage)
     }
@@ -38,14 +43,14 @@ final class TextView: UIView {
     // ponytail: cały tekst w jednym UILabel; przy bardzo długich skryptach (>30 min czytania)
     // przejść na rysowanie tylko widocznego fragmentu.
     var textHeight: CGFloat {
-        ceil(label.sizeThatFits(CGSize(width: Self.size.width - 64, height: .greatestFiniteMagnitude)).height)
+        ceil(label.sizeThatFits(CGSize(width: Self.width - 2 * Self.pad, height: .greatestFiniteMagnitude)).height)
     }
 
     override func layoutSubviews() {
         stage.center = CGPoint(x: bounds.midX, y: bounds.midY)
-        let s = min(bounds.width / Self.size.width, bounds.height / Self.size.height)
+        let s = min(bounds.width / Self.width, bounds.height / stageHeight)
         stage.transform = CGAffineTransform(scaleX: s, y: s)
-        label.frame = CGRect(x: 32, y: Self.size.height * 0.35 - offset, width: Self.size.width - 64, height: textHeight)
+        label.frame = CGRect(x: Self.pad, y: readingLine - offset, width: Self.width - 2 * Self.pad, height: textHeight)
     }
 }
 
@@ -58,7 +63,16 @@ struct Preview: UIViewRepresentable {
 final class Prompter: NSObject, ObservableObject {
     let inline = TextView()
     @Published var isPlaying = false
-    var speed = 50.0 // punkty na sekundę (w skali 800×450)
+    var speed = 50.0 // punkty na sekundę (w skali szerokości 800)
+    var followVoice = false {
+        didSet {
+            if followVoice && !oldValue {
+                SFSpeechRecognizer.requestAuthorization { _ in }
+                AVAudioApplication.requestRecordPermission { _ in }
+            }
+            if isPlaying && followVoice != oldValue { toggle() }
+        }
+    }
 
     private let floating = TextView()
     private let call = AVPictureInPictureVideoCallViewController()
@@ -71,6 +85,17 @@ final class Prompter: NSObject, ObservableObject {
         didSet { inline.offset = offset; floating.offset = offset }
     }
 
+    // Przewijanie za głosem
+    // ponytail: język rozpoznawania na sztywno polski; dodać wybór, gdy pojawią się skrypty w innych językach.
+    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "pl-PL"))
+    private let mic = AVAudioEngine()
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var task: SFSpeechRecognitionTask?
+    private var words: [String] = []   // słowa skryptu, bez wielkich liter i ogonków
+    private var tops: [CGFloat] = []   // pozycja linijki każdego słowa
+    private var cursor = 0             // ostatnie rozpoznane słowo skryptu
+    private var target: CGFloat = 0
+
     override init() {
         super.init()
         // Sesja jak w aplikacji do rozmów wideo. mixWithOthers: nie przerywa dźwięku ani nagrywania TikToka.
@@ -79,17 +104,21 @@ final class Prompter: NSObject, ObservableObject {
         try? session.setActive(true)
         startSilence()
 
-        call.preferredContentSize = TextView.size
+        call.preferredContentSize = CGSize(width: TextView.width, height: inline.stageHeight)
         floating.frame = call.view.bounds
         floating.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         call.view.addSubview(floating)
-        // Stuknięcie w tekst = start/pauza (w aplikacji i — jeśli iOS przepuści dotyk — w pływającym oknie).
+        // Stuknięcie w tekst = start/pauza.
         inline.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(toggle)))
         floating.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(toggle)))
 
         if AVPictureInPictureController.isPictureInPictureSupported() {
             pip = AVPictureInPictureController(contentSource: .init(activeVideoCallSourceView: inline, contentViewController: call))
             pip?.canStartPictureInPictureAutomaticallyFromInline = true
+        }
+        NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: mic, queue: .main) { [weak self] _ in
+            guard let self, self.isPlaying, self.followVoice else { return }
+            try? self.mic.start()
         }
     }
 
@@ -108,6 +137,13 @@ final class Prompter: NSObject, ObservableObject {
         }
     }
 
+    func setWindowHeight(_ height: Double) {
+        inline.stageHeight = height
+        floating.stageHeight = height
+        call.preferredContentSize = CGSize(width: TextView.width, height: height)
+        end = inline.readingLine + inline.textHeight
+    }
+
     func setText(_ text: String, fontSize: Double) {
         let para = NSMutableParagraphStyle()
         para.alignment = .center
@@ -119,8 +155,13 @@ final class Prompter: NSObject, ObservableObject {
         ])
         inline.label.attributedText = str
         floating.label.attributedText = str
-        end = TextView.size.height * 0.35 + inline.textHeight // ostatnia linia wyjeżdża poza górę
+        end = inline.readingLine + inline.textHeight // ostatnia linia wyjeżdża poza górę
         offset = min(offset, end)
+
+        let tokens = Self.tokens(text)
+        words = tokens.map { $0.word }
+        tops = Self.lineTops(str, ranges: tokens.map { $0.range })
+        cursor = min(cursor, max(words.count - 1, 0))
     }
 
     @objc func toggle() {
@@ -128,9 +169,15 @@ final class Prompter: NSObject, ObservableObject {
             timer.invalidate()
             self.timer = nil
             isPlaying = false
+            stopListening()
             return
         }
-        if offset >= end { offset = 0 }
+        if followVoice {
+            target = offset
+            startListening()
+        } else if offset >= end {
+            offset = 0
+        }
         lastTick = CACurrentMediaTime()
         let t = Timer(timeInterval: 1 / 60, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(t, forMode: .common)
@@ -140,18 +187,102 @@ final class Prompter: NSObject, ObservableObject {
 
     private func tick() {
         let now = CACurrentMediaTime()
-        offset = min(offset + CGFloat(speed * (now - lastTick)), end)
+        let dt = now - lastTick
         lastTick = now
+        if followVoice {
+            offset += (target - offset) * CGFloat(min(1, dt * 4)) // płynny dojazd do czytanej linijki
+            return
+        }
+        offset = min(offset + CGFloat(speed * dt), end)
         if offset >= end { toggle() }
     }
 
     func rewind() {
         offset = 0
+        target = 0
+        cursor = 0
     }
 
     func togglePiP() {
         guard let pip else { return }
         pip.isPictureInPictureActive ? pip.stopPictureInPicture() : pip.startPictureInPicture()
+    }
+
+    // MARK: - Głos
+
+    private func startListening() {
+        let input = mic.inputNode
+        let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else { return } // brak zgody na mikrofon
+        input.removeTap(onBus: 0)
+        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+            self?.request?.append(buffer)
+        }
+        try? mic.start()
+        newTask()
+    }
+
+    private func stopListening() {
+        mic.stop()
+        mic.inputNode.removeTap(onBus: 0)
+        task?.cancel()
+        task = nil
+        request = nil
+    }
+
+    // Rozpoznawanie kończy się po ciszy albo po ~1 min (na serwerze Apple) — wtedy zaczynamy nowe.
+    private func newTask() {
+        guard let recognizer else { return }
+        let r = SFSpeechAudioBufferRecognitionRequest()
+        r.shouldReportPartialResults = true
+        if recognizer.supportsOnDeviceRecognition { r.requiresOnDeviceRecognition = true }
+        request = r
+        task = recognizer.recognitionTask(with: r) { [weak self] result, error in
+            DispatchQueue.main.async {
+                guard let self, self.request === r else { return }
+                if let result { self.follow(result.bestTranscription.formattedString) }
+                if error != nil || result?.isFinal == true {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                        if self.isPlaying && self.followVoice && self.request === r { self.newTask() }
+                    }
+                }
+            }
+        }
+    }
+
+    // Szukamy ostatnich 3 usłyszanych słów w skrypcie trochę przed bieżącym miejscem (tylko do przodu).
+    private func follow(_ transcript: String) {
+        let heard = Self.tokens(transcript).suffix(3).map { $0.word }
+        guard !heard.isEmpty, !words.isEmpty else { return }
+        var best = (score: 0, index: 0)
+        for i in cursor..<min(cursor + 25, words.count) {
+            var score = 0
+            for (k, w) in heard.reversed().enumerated() where i - k >= 0 && words[i - k] == w { score += 1 }
+            if score > best.score { best = (score: score, index: i) }
+        }
+        // Pojedyncze krótkie słowo („i”, „w”, „to”) jest wszędzie — po nim nie skaczemy.
+        guard best.score >= 2 || (best.score == 1 && words[best.index].count >= 4) else { return }
+        cursor = best.index
+        target = tops[best.index]
+    }
+
+    static func tokens(_ s: String) -> [(word: String, range: NSRange)] {
+        var out: [(word: String, range: NSRange)] = []
+        s.enumerateSubstrings(in: s.startIndex..., options: .byWords) { w, r, _, _ in
+            if let w { out.append((word: w.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil), range: NSRange(r, in: s))) }
+        }
+        return out
+    }
+
+    // Ten sam układ tekstu co w UILabel, żeby wiedzieć, w której linijce jest każde słowo.
+    static func lineTops(_ str: NSAttributedString, ranges: [NSRange]) -> [CGFloat] {
+        let storage = NSTextStorage(attributedString: str)
+        let layout = NSLayoutManager()
+        let container = NSTextContainer(size: CGSize(width: TextView.width - 2 * TextView.pad, height: .greatestFiniteMagnitude))
+        container.lineFragmentPadding = 0
+        layout.addTextContainer(container)
+        storage.addLayoutManager(layout)
+        return ranges.map { layout.boundingRect(forGlyphRange: layout.glyphRange(forCharacterRange: $0, actualCharacterRange: nil), in: container).minY }
     }
 }
 
@@ -160,12 +291,14 @@ struct ContentView: View {
     @AppStorage("script") private var script = "Wklej tutaj swój tekst.\n\nNaciśnij „Pływające okno”, a potem przejdź do aparatu lub dowolnej innej aplikacji — tekst zostanie na wierzchu."
     @AppStorage("fontSize") private var fontSize = 48.0
     @AppStorage("speed") private var speed = 50.0
+    @AppStorage("windowHeight") private var windowHeight = 450.0
+    @AppStorage("followVoice") private var followVoice = false
     @FocusState private var editing: Bool
 
     var body: some View {
         VStack(spacing: 14) {
             Preview(view: prompter.inline)
-                .aspectRatio(16 / 9, contentMode: .fit)
+                .aspectRatio(TextView.width / windowHeight, contentMode: .fit)
                 .background(.black)
                 .clipShape(RoundedRectangle(cornerRadius: 12))
 
@@ -182,8 +315,11 @@ struct ContentView: View {
             .buttonStyle(.bordered)
             .controlSize(.large)
 
+            Toggle("Przewijaj za głosem", isOn: $followVoice)
             LabeledContent("Prędkość") { Slider(value: $speed, in: 10...200) }
+                .disabled(followVoice)
             LabeledContent("Czcionka") { Slider(value: $fontSize, in: 24...96) }
+            LabeledContent("Wysokość okna") { Slider(value: $windowHeight, in: 150...450) }
 
             TextEditor(text: $script)
                 .focused($editing)
@@ -199,10 +335,14 @@ struct ContentView: View {
         }
         .onAppear {
             prompter.speed = speed
+            prompter.followVoice = followVoice
+            prompter.setWindowHeight(windowHeight)
             prompter.setText(script, fontSize: fontSize)
         }
         .onChange(of: script) { prompter.setText(script, fontSize: fontSize) }
         .onChange(of: fontSize) { prompter.setText(script, fontSize: fontSize) }
         .onChange(of: speed) { prompter.speed = speed }
+        .onChange(of: windowHeight) { prompter.setWindowHeight(windowHeight) }
+        .onChange(of: followVoice) { prompter.followVoice = followVoice }
     }
 }
