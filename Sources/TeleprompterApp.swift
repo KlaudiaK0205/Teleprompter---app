@@ -109,6 +109,12 @@ final class Prompter: NSObject, ObservableObject {
         floating.frame = call.view.bounds
         floating.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         call.view.addSubview(floating)
+        // Okno rozmowy nie ma systemowego X, więc dokładamy własny w prawym górnym rogu.
+        let close = UIButton(type: .close, primaryAction: UIAction { [weak self] _ in self?.pip?.stopPictureInPicture() })
+        close.frame = CGRect(x: call.view.bounds.width - 40, y: 8, width: 32, height: 32)
+        close.autoresizingMask = [.flexibleLeftMargin, .flexibleBottomMargin]
+        close.accessibilityLabel = "Zamknij pływające okno"
+        call.view.addSubview(close)
         // Stuknięcie w tekst = start/pauza.
         inline.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(toggle)))
         floating.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(toggle)))
