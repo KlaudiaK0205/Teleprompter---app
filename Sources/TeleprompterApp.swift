@@ -296,12 +296,23 @@ final class Prompter: NSObject, ObservableObject {
 struct Script: Codable, Equatable {
     var text: String
     var file: String? = nil // nazwa pliku w folderze z iCloud Drive, jeśli skrypt stamtąd pochodzi
+    var part: Int? = nil    // który fragment pliku (fragmenty oddziela linia „---”); nil = cały plik
 
-    // Nazwa: plik bez rozszerzenia albo pierwsza niepusta linijka.
+    // Nazwa: plik bez rozszerzenia (cały plik) albo pierwsza niepusta linijka.
     var title: String {
-        if let file { return (file as NSString).deletingPathExtension }
-        let line = text.split(whereSeparator: \.isNewline).first { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        if let file, part == nil { return (file as NSString).deletingPathExtension }
+        let line = plain.split(whereSeparator: \.isNewline).first { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
         return line.map { String($0.prefix(40)) } ?? "Nowy skrypt"
+    }
+
+    // Plik zbiorczy: skrypty oddzielone linijką z samych myślników (co najmniej trzech).
+    static func split(_ text: String) -> [String] {
+        var parts: [[Substring]] = [[]]
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if t.count >= 3, t.allSatisfy({ $0 == "-" }) { parts.append([]) } else { parts[parts.count - 1].append(line) }
+        }
+        return parts.map { $0.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
     }
 
     // Do wyświetlenia: z .md zdejmujemy nagłówki (# ) i znaczniki (**pogrubienia**, [linki](…)).
@@ -337,9 +348,17 @@ struct ContentView: View {
         Binding(get: { scripts[index].text }, set: {
             scripts[index].text = $0
             // Zmiany w skrypcie z folderu wracają do pliku, więc widać je też na komputerze.
-            if let file = scripts[index].file, let folder {
-                try? $0.write(to: folder.appendingPathComponent(file), atomically: true, encoding: .utf8)
+            guard let file = scripts[index].file, let folder else { return }
+            let url = folder.appendingPathComponent(file)
+            var out = $0
+            if let part = scripts[index].part { // w pliku zbiorczym podmieniamy tylko ten fragment
+                guard let disk = Self.read(url) else { return }
+                var parts = Script.split(disk)
+                guard parts.indices.contains(part) else { return }
+                parts[part] = $0
+                out = parts.joined(separator: "\n\n---\n\n")
             }
+            try? out.write(to: url, atomically: true, encoding: .utf8)
         })
     }
 
@@ -382,12 +401,18 @@ struct ContentView: View {
                 downloading = true
                 continue
             }
-            if let i = scripts.firstIndex(where: { $0.file == name }) {
-                if scripts[i].text != text { scripts[i].text = text }
-            } else {
-                scripts.append(Script(text: text, file: name))
+            let parts = Script.split(text)
+            let ids: [Int?] = parts.count == 1 ? [nil] : parts.indices.map { Optional($0) }
+            for (id, part) in zip(ids, parts) {
+                if let i = scripts.firstIndex(where: { $0.file == name && $0.part == id }) {
+                    if scripts[i].text != part { scripts[i].text = part }
+                } else {
+                    scripts.append(Script(text: part, file: name, part: id))
+                }
             }
+            scripts.removeAll { $0.file == name && !ids.contains($0.part) } // fragmenty usunięte z pliku
         }
+        if scripts.isEmpty { scripts.append(Script(text: "")) }
         if downloading && retries > 0 {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { syncFolder(retries: retries - 1) }
         }
@@ -397,7 +422,7 @@ struct ContentView: View {
     private static func read(_ url: URL) -> String? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .windowsCP1250)
-        return text?.replacingOccurrences(of: "\u{FEFF}", with: "")
+        return text?.replacingOccurrences(of: "\u{FEFF}", with: "").replacingOccurrences(of: "\r\n", with: "\n")
     }
 
     var body: some View {
