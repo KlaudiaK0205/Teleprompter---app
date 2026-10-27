@@ -48,9 +48,6 @@ final class Prompter: NSObject, ObservableObject {
 
     override init() {
         super.init()
-        // mixWithOthers: nie przerywa dźwięku TikToka ani nagrywania. Film nie ma ścieżki audio.
-        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback, options: .mixWithOthers)
-        try? AVAudioSession.sharedInstance().setActive(true)
         player.isMuted = true
         player.actionAtItemEnd = .pause
         let layer = view.layer as! AVPlayerLayer
@@ -64,6 +61,19 @@ final class Prompter: NSObject, ObservableObject {
         statusObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] p, _ in
             DispatchQueue.main.async { self?.isPlaying = p.timeControlStatus != .paused }
         }
+    }
+
+    // TEST: nad TikTokiem iOS chowa i wyłącza nasze okno. Sprawdzamy, czy decyduje o tym rodzaj sesji audio.
+    // mixWithOthers wszędzie: nie przerywa dźwięku TikToka ani nagrywania. Film nie ma ścieżki audio.
+    func setAudioMode(_ mode: Int) {
+        let session = AVAudioSession.sharedInstance()
+        try? session.setActive(false)
+        switch mode {
+        case 1: try? session.setCategory(.playback, mode: .default, options: .mixWithOthers)
+        case 2: try? session.setCategory(.playAndRecord, mode: .videoChat, options: [.mixWithOthers, .defaultToSpeaker])
+        default: try? session.setCategory(.playback, mode: .moviePlayback, options: .mixWithOthers)
+        }
+        try? session.setActive(true)
     }
 
     func setText(_ text: String, fontSize: Double) {
@@ -199,6 +209,7 @@ struct ContentView: View {
     @AppStorage("script") private var script = "Wklej tutaj swój tekst.\n\nNaciśnij „Pływające okno”, a potem przejdź do aparatu lub dowolnej innej aplikacji — tekst zostanie na wierzchu."
     @AppStorage("fontSize") private var fontSize = 48.0
     @AppStorage("speed") private var speed = 50.0
+    @AppStorage("audioMode") private var audioMode = 0
     @FocusState private var editing: Bool
 
     var body: some View {
@@ -225,6 +236,12 @@ struct ContentView: View {
 
             LabeledContent("Prędkość") { Slider(value: $speed, in: 10...200) }
             LabeledContent("Czcionka") { Slider(value: $fontSize, in: 24...96) }
+            Picker("Tryb (test)", selection: $audioMode) {
+                Text("A: Film").tag(0)
+                Text("B: Zwykły").tag(1)
+                Text("C: Rozmowa").tag(2)
+            }
+            .pickerStyle(.segmented)
 
             TextEditor(text: $script)
                 .focused($editing)
@@ -238,7 +255,9 @@ struct ContentView: View {
                 Button("Gotowe") { editing = false }
             }
         }
+        .onChange(of: audioMode) { prompter.setAudioMode(audioMode) }
         .onAppear {
+            prompter.setAudioMode(audioMode)
             prompter.speed = speed
             prompter.setText(script, fontSize: fontSize)
         }

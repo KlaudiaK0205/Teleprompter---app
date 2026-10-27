@@ -15,6 +15,7 @@ targets:
         UILaunchScreen: {}
         UIBackgroundModes: [audio] # „Audio, AirPlay i Obraz w Obrazie” — wymagane przez PiP
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        NSMicrophoneUsageDescription: Tryb „Rozmowa” zgłasza aplikację jako rozmowę wideo, żeby iOS nie chował okna nad aparatem. Nic nie jest nagrywane.
     settings:
       base:
         SWIFT_VERSION: "5.0"
