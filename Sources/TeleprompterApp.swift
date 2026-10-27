@@ -288,12 +288,31 @@ final class Prompter: NSObject, ObservableObject {
 
 struct ContentView: View {
     @StateObject private var prompter = Prompter()
-    @AppStorage("script") private var script = "Wklej tutaj swój tekst.\n\nNaciśnij „Pływające okno”, a potem przejdź do aparatu lub dowolnej innej aplikacji — tekst zostanie na wierzchu."
+    @State private var scripts = Self.loadScripts()
+    @AppStorage("current") private var current = 0
+    @State private var confirmDelete = false
     @AppStorage("fontSize") private var fontSize = 48.0
     @AppStorage("speed") private var speed = 50.0
     @AppStorage("windowHeight") private var windowHeight = 450.0
     @AppStorage("followVoice") private var followVoice = false
     @FocusState private var editing: Bool
+
+    // Zawsze jest co najmniej jeden skrypt (ostatniego nie da się usunąć).
+    private var index: Int { min(max(current, 0), scripts.count - 1) }
+    private var text: Binding<String> { Binding(get: { scripts[index] }, set: { scripts[index] = $0 }) }
+
+    private static func loadScripts() -> [String] {
+        if let data = UserDefaults.standard.data(forKey: "scripts"),
+           let saved = try? JSONDecoder().decode([String].self, from: data), !saved.isEmpty { return saved }
+        // Pierwsze uruchomienie albo tekst z wersji sprzed listy skryptów.
+        return [UserDefaults.standard.string(forKey: "script") ?? "Wklej tutaj swój tekst.\n\nNaciśnij „Pływające okno”, a potem przejdź do aparatu lub dowolnej innej aplikacji — tekst zostanie na wierzchu."]
+    }
+
+    // Nazwa skryptu = jego pierwsza niepusta linijka.
+    private static func title(_ script: String) -> String {
+        let line = script.split(whereSeparator: \.isNewline).first { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        return line.map { String($0.prefix(40)) } ?? "Nowy skrypt"
+    }
 
     var body: some View {
         VStack(spacing: 14) {
@@ -321,7 +340,33 @@ struct ContentView: View {
             LabeledContent("Czcionka") { Slider(value: $fontSize, in: 24...96) }
             LabeledContent("Wysokość okna") { Slider(value: $windowHeight, in: 150...450) }
 
-            TextEditor(text: $script)
+            HStack {
+                Menu {
+                    Picker("Skrypt", selection: $current) {
+                        ForEach(scripts.indices, id: \.self) { Text(Self.title(scripts[$0])).tag($0) }
+                    }
+                    Divider()
+                    Button("Nowy skrypt", systemImage: "plus") {
+                        scripts.append("")
+                        current = scripts.count - 1
+                        editing = true
+                    }
+                    Button("Usuń ten skrypt", systemImage: "trash", role: .destructive) { confirmDelete = true }
+                        .disabled(scripts.count < 2)
+                } label: {
+                    Label(Self.title(scripts[index]), systemImage: "doc.text").lineLimit(1)
+                }
+                Spacer()
+            }
+            .confirmationDialog("Usunąć „\(Self.title(scripts[index]))”?", isPresented: $confirmDelete, titleVisibility: .visible) {
+                Button("Usuń", role: .destructive) {
+                    let i = index
+                    current = max(0, i - 1)
+                    scripts.remove(at: i)
+                }
+            }
+
+            TextEditor(text: text)
                 .focused($editing)
                 .padding(8)
                 .overlay(RoundedRectangle(cornerRadius: 12).stroke(.secondary.opacity(0.4)))
@@ -337,10 +382,17 @@ struct ContentView: View {
             prompter.speed = speed
             prompter.followVoice = followVoice
             prompter.setWindowHeight(windowHeight)
-            prompter.setText(script, fontSize: fontSize)
+            prompter.setText(scripts[index], fontSize: fontSize)
         }
-        .onChange(of: script) { prompter.setText(script, fontSize: fontSize) }
-        .onChange(of: fontSize) { prompter.setText(script, fontSize: fontSize) }
+        .onChange(of: scripts) {
+            UserDefaults.standard.set(try? JSONEncoder().encode(scripts), forKey: "scripts")
+            prompter.setText(scripts[index], fontSize: fontSize)
+        }
+        .onChange(of: current) {
+            prompter.rewind()
+            prompter.setText(scripts[index], fontSize: fontSize)
+        }
+        .onChange(of: fontSize) { prompter.setText(scripts[index], fontSize: fontSize) }
         .onChange(of: speed) { prompter.speed = speed }
         .onChange(of: windowHeight) { prompter.setWindowHeight(windowHeight) }
         .onChange(of: followVoice) { prompter.followVoice = followVoice }
