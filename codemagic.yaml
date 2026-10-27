@@ -1,0 +1,12 @@
+# Ten sam build co .github/workflows/build.yml, ale na Codemagic (darmowe 500 min/mies. na Macu).
+workflows:
+  teleprompter:
+    name: Teleprompter IPA
+    instance_type: mac_mini_m2
+    max_build_duration: 30
+    scripts:
+      - brew install xcodegen && xcodegen
+      - xcodebuild -project Teleprompter.xcodeproj -target Teleprompter -sdk iphoneos -configuration Release CODE_SIGNING_ALLOWED=NO build
+      - mkdir Payload && cp -R build/Release-iphoneos/Teleprompter.app Payload/ && zip -r Teleprompter.ipa Payload
+    artifacts:
+      - Teleprompter.ipa
