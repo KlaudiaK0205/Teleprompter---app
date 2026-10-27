@@ -104,7 +104,10 @@ final class Prompter: NSObject, ObservableObject {
         let time = player.currentTime()
         let wasPlaying = player.rate > 0
         player.replaceCurrentItem(with: AVPlayerItem(url: url))
-        player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+        // Przy pierwszym filmie czas jest nieprawidłowy, a seek do niego wywraca aplikację.
+        if time.isNumeric && time > .zero {
+            player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+        }
         if wasPlaying { player.play() }
         if let file { try? FileManager.default.removeItem(at: file) }
         file = url
