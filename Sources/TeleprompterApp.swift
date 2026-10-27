@@ -4,7 +4,9 @@ import AVFoundation
 
 // iOS nie pozwala na nakładki systemowe. Jedyne okno, które pływa nad innymi
 // aplikacjami (aparat, Instagram, TikTok…), to Obraz w Obrazie (PiP).
-// Dlatego tekst renderujemy jako „wideo” do AVSampleBufferDisplayLayer i wysyłamy do PiP.
+// Tekst zapisujemy jako prawdziwy film i odtwarzamy go AVPlayerem w PiP. Taki film
+// odtwarza sam system, więc ▶︎/⏸ działa nawet wtedy, gdy TikTok przejmie dźwięk.
+// (Wcześniejsza wersja z rysowaniem na żywo do AVSampleBufferDisplayLayer była nad TikTokiem wyłączana przez iOS.)
 
 @main
 struct TeleprompterApp: App {
@@ -14,7 +16,7 @@ struct TeleprompterApp: App {
 }
 
 final class PreviewView: UIView {
-    override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
+    override class var layerClass: AnyClass { AVPlayerLayer.self }
 }
 
 struct Preview: UIViewRepresentable {
@@ -23,80 +25,96 @@ struct Preview: UIViewRepresentable {
     func updateUIView(_ uiView: UIView, context: Context) {}
 }
 
-final class Prompter: NSObject, ObservableObject, AVPictureInPictureSampleBufferPlaybackDelegate {
+final class Prompter: NSObject, ObservableObject {
     static let width = 800, height = 450
+    static let fps: Int32 = 30
+    static let base = 50.0 // piksele na sekundę przy normalnej prędkości filmu; suwak zmienia tempo odtwarzania
 
     let view = PreviewView()
-    var displayLayer: AVSampleBufferDisplayLayer { view.layer as! AVSampleBufferDisplayLayer }
+    let player = AVPlayer()
     @Published var isPlaying = false
-    var speed = 60.0 // piksele na sekundę
+    @Published var isPreparing = false
+    var speed = base {
+        didSet {
+            player.defaultRate = Float(speed / Self.base) // tego tempa używa też ▶︎ w oknie PiP
+            if player.rate > 0 { player.rate = player.defaultRate }
+        }
+    }
 
     private var pip: AVPictureInPictureController?
-    private var page: CGImage?
-    private var offset = 0.0
-    private var last = CACurrentMediaTime()
-    private var pool: CVPixelBufferPool?
-    private let engine = AVAudioEngine()
-    private let silence = AVAudioPlayerNode()
-    // DIAGNOSTYKA: żółta linijka na dole okna PiP. Usunąć po znalezieniu problemu z TikTokiem.
-    private var frame = 0
-    private var events: [String] = []
-    private func log(_ s: String) { events = Array((events + ["\(frame):\(s)"]).suffix(3)) }
+    private var job: Task<Void, Never>?
+    private var file: URL?
+    private var statusObservation: NSKeyValueObservation?
 
     override init() {
         super.init()
-        setUpSilence()
-        displayLayer.videoGravity = .resizeAspect
+        // mixWithOthers: nie przerywa dźwięku TikToka ani nagrywania. Film nie ma ścieżki audio.
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback, options: .mixWithOthers)
+        try? AVAudioSession.sharedInstance().setActive(true)
+        player.isMuted = true
+        player.actionAtItemEnd = .pause
+        let layer = view.layer as! AVPlayerLayer
+        layer.player = player
+        layer.videoGravity = .resizeAspect
         if AVPictureInPictureController.isPictureInPictureSupported() {
-            pip = AVPictureInPictureController(contentSource: .init(sampleBufferDisplayLayer: displayLayer, playbackDelegate: self))
-            // Wyjście na ekran główny / do innej aplikacji samo otwiera pływające okno.
+            pip = AVPictureInPictureController(playerLayer: layer)
+            // Wyjście na ekran główny / do innej aplikacji w trakcie przewijania samo otwiera pływające okno.
             pip?.canStartPictureInPictureAutomaticallyFromInline = true
         }
-        // Timer, nie CADisplayLink: działa też w tle, gdy PiP jest aktywne.
-        let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.tick() }
-        RunLoop.main.add(timer, forMode: .common)
+        statusObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] p, _ in
+            DispatchQueue.main.async { self?.isPlaying = p.timeControlStatus != .paused }
+        }
     }
 
-    // iOS usypia aplikację w tle, gdy inna (np. TikTok) zabierze dźwięk — wtedy PiP zamarza.
-    // Grająca w pętli cisza, zmiksowana z innymi, utrzymuje aplikację przy życiu,
-    // nie przerywa dźwięku TikToka i nie trafia do nagrania.
-    private func setUpSilence() {
-        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback, options: .mixWithOthers)
-        let format = engine.mainMixerNode.outputFormat(forBus: 0)
-        engine.attach(silence)
-        engine.connect(silence, to: engine.mainMixerNode, format: format)
-        silence.volume = 0
-        if let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(format.sampleRate)) {
-            buffer.frameLength = buffer.frameCapacity
-            silence.scheduleBuffer(buffer, at: nil, options: .loops)
+    func setText(_ text: String, fontSize: Double) {
+        job?.cancel()
+        isPreparing = true
+        job = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(600)) // nie kodujemy filmu przy każdej literze
+            guard !Task.isCancelled, let page = Self.renderPage(text, fontSize: fontSize) else { return }
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mp4")
+            do {
+                try await Self.encode(page, to: url)
+            } catch {
+                if !Task.isCancelled { await MainActor.run { self?.isPreparing = false } }
+                return
+            }
+            await MainActor.run { self?.show(url) }
         }
-        let center = NotificationCenter.default
-        center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] n in
-            let began = (n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt) == AVAudioSession.InterruptionType.began.rawValue
-            self?.log(began ? "przerwa+" : "przerwa-")
-            self?.startSilence()
-        }
-        center.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: .main) { [weak self] _ in
-            self?.log("cfg")
-            self?.startSilence()
-        }
-        startSilence()
     }
 
-    private func startSilence() {
-        do { try AVAudioSession.sharedInstance().setActive(true) } catch { log("sesja err \((error as NSError).code)") }
-        if !engine.isRunning {
-            do { try engine.start() } catch { log("engine err \((error as NSError).code)") }
+    func toggle() {
+        if player.rate > 0 { return player.pause() }
+        if let item = player.currentItem, item.duration.isNumeric, item.currentTime() >= item.duration {
+            player.seek(to: .zero)
         }
-        if engine.isRunning && !silence.isPlaying { silence.play() }
+        player.play()
     }
 
-    private var maxOffset: Double { Double((page?.height ?? Self.height) - Self.height) }
+    func rewind() {
+        player.seek(to: .zero)
+    }
+
+    func togglePiP() {
+        guard let pip else { return }
+        pip.isPictureInPictureActive ? pip.stopPictureInPicture() : pip.startPictureInPicture()
+    }
+
+    private func show(_ url: URL) {
+        let time = player.currentTime()
+        let wasPlaying = player.rate > 0
+        player.replaceCurrentItem(with: AVPlayerItem(url: url))
+        player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+        if wasPlaying { player.play() }
+        if let file { try? FileManager.default.removeItem(at: file) }
+        file = url
+        isPreparing = false
+    }
 
     // ponytail: cały tekst jako jeden obraz (~1,4 MB na 1000 px wysokości); przy bardzo długich
     // skryptach (>30 min czytania) przejść na renderowanie tylko widocznego fragmentu.
-    func setText(_ text: String, fontSize: Double) {
-        let w = CGFloat(Self.width), h = CGFloat(Self.height), pad: CGFloat = 32
+    private static func renderPage(_ text: String, fontSize: Double) -> CGImage? {
+        let w = CGFloat(width), h = CGFloat(height), pad: CGFloat = 32
         let para = NSMutableParagraphStyle()
         para.alignment = .center
         para.lineSpacing = fontSize * 0.25
@@ -113,128 +131,63 @@ final class Prompter: NSObject, ObservableObject, AVPictureInPictureSampleBuffer
         format.scale = 1
         format.opaque = true
         format.preferredRange = .standard
-        page = UIGraphicsImageRenderer(size: CGSize(width: w, height: total), format: format).image { ctx in
+        return UIGraphicsImageRenderer(size: CGSize(width: w, height: total), format: format).image { ctx in
             UIColor.black.setFill()
             ctx.fill(CGRect(x: 0, y: 0, width: w, height: total))
             str.draw(with: CGRect(x: pad, y: top, width: w - 2 * pad, height: textH),
                      options: [.usesLineFragmentOrigin, .usesFontLeading], context: nil)
         }.cgImage
-        offset = min(offset, maxOffset)
-        draw()
     }
 
-    func toggle() {
-        isPlaying.toggle()
-        pip?.invalidatePlaybackState()
-    }
+    // Film: kadr 800×450 przesuwa się po obrazie z tekstem o `base / fps` pikseli na klatkę.
+    private static func encode(_ page: CGImage, to url: URL) async throws {
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
+        ])
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: width,
+            kCVPixelBufferHeightKey as String: height,
+        ])
+        writer.add(input)
+        guard writer.startWriting() else { throw writer.error ?? CancellationError() }
+        writer.startSession(atSourceTime: .zero)
 
-    func rewind() {
-        offset = 0
-        draw()
-    }
-
-    func togglePiP() {
-        guard let pip else { return }
-        pip.isPictureInPictureActive ? pip.stopPictureInPicture() : pip.startPictureInPicture()
-    }
-
-    private func tick() {
-        let now = CACurrentMediaTime()
-        defer { last = now }
-        if isPlaying {
-            offset = min(offset + speed * (now - last), maxOffset)
-            if offset >= maxOffset {
-                isPlaying = false
-                pip?.invalidatePlaybackState()
+        let step = base / Double(fps)
+        let maxOffset = Double(page.height - height)
+        do {
+            for i in 0...Int(maxOffset / step) {
+                try Task.checkCancellation()
+                while !input.isReadyForMoreMediaData { try await Task.sleep(for: .milliseconds(5)) }
+                guard let pool = adaptor.pixelBufferPool else { throw writer.error ?? CancellationError() }
+                var buffer: CVPixelBuffer?
+                CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer)
+                guard let buffer else { continue }
+                draw(page, offset: min(Double(i) * step, maxOffset), into: buffer)
+                _ = adaptor.append(buffer, withPresentationTime: CMTime(value: CMTimeValue(i), timescale: fps))
             }
+        } catch {
+            writer.cancelWriting()
+            try? FileManager.default.removeItem(at: url)
+            throw error
         }
-        draw() // także w pauzie, żeby licznik klatek pokazywał, czy aplikacja żyje
+        input.markAsFinished()
+        await writer.finishWriting()
+        if writer.status != .completed { throw writer.error ?? CancellationError() }
     }
 
-    private func draw() {
-        guard let page, let visible = page.cropping(to: CGRect(x: 0, y: Int(offset), width: Self.width, height: Self.height)) else { return }
-        if pool == nil {
-            let attrs: [CFString: Any] = [
-                kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
-                kCVPixelBufferWidthKey: Self.width,
-                kCVPixelBufferHeightKey: Self.height,
-                kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
-            ]
-            CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &pool)
-        }
-        var buffer: CVPixelBuffer?
-        guard let pool, CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer) == kCVReturnSuccess, let buffer else { return }
-
+    private static func draw(_ page: CGImage, offset: Double, into buffer: CVPixelBuffer) {
+        guard let visible = page.cropping(to: CGRect(x: 0, y: Int(offset), width: width, height: height)) else { return }
         CVPixelBufferLockBaseAddress(buffer, [])
-        let ctx = CGContext(data: CVPixelBufferGetBaseAddress(buffer), width: Self.width, height: Self.height,
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        let ctx = CGContext(data: CVPixelBufferGetBaseAddress(buffer), width: width, height: height,
                             bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
                             space: CGColorSpaceCreateDeviceRGB(),
                             bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
-        ctx?.draw(visible, in: CGRect(x: 0, y: 0, width: Self.width, height: Self.height))
-        if let ctx {
-            frame += 1
-            let s = AVAudioSession.sharedInstance()
-            let status = "#\(frame) play:\(isPlaying ? 1 : 0) eng:\(engine.isRunning ? 1 : 0) inne:\(s.isOtherAudioPlaying ? 1 : 0) | "
-                + events.joined(separator: " · ")
-            ctx.saveGState()
-            ctx.translateBy(x: 0, y: CGFloat(Self.height))
-            ctx.scaleBy(x: 1, y: -1)
-            UIGraphicsPushContext(ctx)
-            (status as NSString).draw(at: CGPoint(x: 8, y: CGFloat(Self.height) - 26), withAttributes: [
-                .font: UIFont.monospacedSystemFont(ofSize: 16, weight: .regular),
-                .foregroundColor: UIColor.yellow,
-            ])
-            UIGraphicsPopContext()
-            ctx.restoreGState()
-        }
-        CVPixelBufferUnlockBaseAddress(buffer, [])
-
-        var format: CMVideoFormatDescription?
-        CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: buffer, formatDescriptionOut: &format)
-        guard let format else { return }
-        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()), decodeTimeStamp: .invalid)
-        var sample: CMSampleBuffer?
-        CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: buffer, formatDescription: format,
-                                                 sampleTiming: &timing, sampleBufferOut: &sample)
-        guard let sample else { return }
-        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true) {
-            let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
-            CFDictionarySetValue(dict, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
-                                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
-        }
-        if displayLayer.status == .failed { displayLayer.flush() }
-        displayLayer.enqueue(sample)
-    }
-
-    // MARK: przyciski w oknie PiP
-
-    func pictureInPictureController(_ c: AVPictureInPictureController, setPlaying playing: Bool) {
-        log("set\(playing ? 1 : 0)")
-        // ponytail: zgadujemy, że to iOS pauzuje nas, gdy inna aplikacja gra dźwięk — wtedy przewijamy dalej.
-        // Ceną jest brak pauzy w tej sytuacji; diagnostyka pokaże, czy założenie jest trafne.
-        if !playing && UIApplication.shared.applicationState == .background && AVAudioSession.sharedInstance().isOtherAudioPlaying {
-            log("ignor")
-            c.invalidatePlaybackState()
-            return
-        }
-        if playing { startSilence() }
-        isPlaying = playing
-    }
-
-    func pictureInPictureControllerTimeRangeForPlayback(_ c: AVPictureInPictureController) -> CMTimeRange {
-        CMTimeRange(start: .negativeInfinity, duration: .positiveInfinity) // „na żywo” = brak paska postępu
-    }
-
-    func pictureInPictureControllerIsPlaybackPaused(_ c: AVPictureInPictureController) -> Bool {
-        !isPlaying
-    }
-
-    func pictureInPictureController(_ c: AVPictureInPictureController, didTransitionToRenderSize newRenderSize: CMVideoDimensions) {}
-
-    func pictureInPictureController(_ c: AVPictureInPictureController, skipByInterval skipInterval: CMTime, completion completionHandler: @escaping () -> Void) {
-        offset = min(max(0, offset + skipInterval.seconds * speed), maxOffset)
-        draw()
-        completionHandler()
+        ctx?.draw(visible, in: CGRect(x: 0, y: 0, width: width, height: height))
     }
 }
 
@@ -242,13 +195,15 @@ struct ContentView: View {
     @StateObject private var prompter = Prompter()
     @AppStorage("script") private var script = "Wklej tutaj swój tekst.\n\nNaciśnij „Pływające okno”, a potem przejdź do aparatu lub dowolnej innej aplikacji — tekst zostanie na wierzchu."
     @AppStorage("fontSize") private var fontSize = 48.0
-    @AppStorage("speed") private var speed = 60.0
+    @AppStorage("speed") private var speed = 50.0
     @FocusState private var editing: Bool
 
     var body: some View {
         VStack(spacing: 14) {
             Preview(view: prompter.view)
                 .aspectRatio(16 / 9, contentMode: .fit)
+                .background(.black)
+                .overlay { if prompter.isPreparing { ProgressView().tint(.white) } }
                 .clipShape(RoundedRectangle(cornerRadius: 12))
 
             HStack(spacing: 12) {
@@ -263,8 +218,9 @@ struct ContentView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.large)
+            .disabled(prompter.isPreparing)
 
-            LabeledContent("Prędkość") { Slider(value: $speed, in: 10...250) }
+            LabeledContent("Prędkość") { Slider(value: $speed, in: 10...200) }
             LabeledContent("Czcionka") { Slider(value: $fontSize, in: 24...96) }
 
             TextEditor(text: $script)
