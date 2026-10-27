@@ -38,6 +38,10 @@ final class Prompter: NSObject, ObservableObject, AVPictureInPictureSampleBuffer
     private var pool: CVPixelBufferPool?
     private let engine = AVAudioEngine()
     private let silence = AVAudioPlayerNode()
+    // DIAGNOSTYKA: żółta linijka na dole okna PiP. Usunąć po znalezieniu problemu z TikTokiem.
+    private var frame = 0
+    private var events: [String] = []
+    private func log(_ s: String) { events = Array((events + ["\(frame):\(s)"]).suffix(3)) }
 
     override init() {
         super.init()
@@ -67,15 +71,23 @@ final class Prompter: NSObject, ObservableObject, AVPictureInPictureSampleBuffer
             silence.scheduleBuffer(buffer, at: nil, options: .loops)
         }
         let center = NotificationCenter.default
-        for name in [AVAudioSession.interruptionNotification, .AVAudioEngineConfigurationChange] {
-            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.startSilence() }
+        center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] n in
+            let began = (n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt) == AVAudioSession.InterruptionType.began.rawValue
+            self?.log(began ? "przerwa+" : "przerwa-")
+            self?.startSilence()
+        }
+        center.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: .main) { [weak self] _ in
+            self?.log("cfg")
+            self?.startSilence()
         }
         startSilence()
     }
 
     private func startSilence() {
-        try? AVAudioSession.sharedInstance().setActive(true)
-        if !engine.isRunning { try? engine.start() }
+        do { try AVAudioSession.sharedInstance().setActive(true) } catch { log("sesja err \((error as NSError).code)") }
+        if !engine.isRunning {
+            do { try engine.start() } catch { log("engine err \((error as NSError).code)") }
+        }
         if engine.isRunning && !silence.isPlaying { silence.play() }
     }
 
@@ -129,13 +141,14 @@ final class Prompter: NSObject, ObservableObject, AVPictureInPictureSampleBuffer
     private func tick() {
         let now = CACurrentMediaTime()
         defer { last = now }
-        guard isPlaying else { return }
-        offset = min(offset + speed * (now - last), maxOffset)
-        if offset >= maxOffset {
-            isPlaying = false
-            pip?.invalidatePlaybackState()
+        if isPlaying {
+            offset = min(offset + speed * (now - last), maxOffset)
+            if offset >= maxOffset {
+                isPlaying = false
+                pip?.invalidatePlaybackState()
+            }
         }
-        draw()
+        draw() // także w pauzie, żeby licznik klatek pokazywał, czy aplikacja żyje
     }
 
     private func draw() {
@@ -158,6 +171,22 @@ final class Prompter: NSObject, ObservableObject, AVPictureInPictureSampleBuffer
                             space: CGColorSpaceCreateDeviceRGB(),
                             bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
         ctx?.draw(visible, in: CGRect(x: 0, y: 0, width: Self.width, height: Self.height))
+        if let ctx {
+            frame += 1
+            let s = AVAudioSession.sharedInstance()
+            let status = "#\(frame) play:\(isPlaying ? 1 : 0) eng:\(engine.isRunning ? 1 : 0) inne:\(s.isOtherAudioPlaying ? 1 : 0) | "
+                + events.joined(separator: " · ")
+            ctx.saveGState()
+            ctx.translateBy(x: 0, y: CGFloat(Self.height))
+            ctx.scaleBy(x: 1, y: -1)
+            UIGraphicsPushContext(ctx)
+            (status as NSString).draw(at: CGPoint(x: 8, y: CGFloat(Self.height) - 26), withAttributes: [
+                .font: UIFont.monospacedSystemFont(ofSize: 16, weight: .regular),
+                .foregroundColor: UIColor.yellow,
+            ])
+            UIGraphicsPopContext()
+            ctx.restoreGState()
+        }
         CVPixelBufferUnlockBaseAddress(buffer, [])
 
         var format: CMVideoFormatDescription?
@@ -180,6 +209,14 @@ final class Prompter: NSObject, ObservableObject, AVPictureInPictureSampleBuffer
     // MARK: przyciski w oknie PiP
 
     func pictureInPictureController(_ c: AVPictureInPictureController, setPlaying playing: Bool) {
+        log("set\(playing ? 1 : 0)")
+        // ponytail: zgadujemy, że to iOS pauzuje nas, gdy inna aplikacja gra dźwięk — wtedy przewijamy dalej.
+        // Ceną jest brak pauzy w tej sytuacji; diagnostyka pokaże, czy założenie jest trafne.
+        if !playing && UIApplication.shared.applicationState == .background && AVAudioSession.sharedInstance().isOtherAudioPlaying {
+            log("ignor")
+            c.invalidatePlaybackState()
+            return
+        }
         if playing { startSilence() }
         isPlaying = playing
     }
