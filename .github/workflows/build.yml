@@ -1,0 +1,16 @@
+# Buduje niepodpisany Teleprompter.ipa na Macu w chmurze GitHuba.
+# Pobierz go z zakładki Actions → ostatni build → Artifacts.
+name: build-ipa
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install xcodegen && xcodegen
+      - run: xcodebuild -project Teleprompter.xcodeproj -target Teleprompter -sdk iphoneos -configuration Release CODE_SIGNING_ALLOWED=NO build
+      - run: mkdir Payload && cp -R build/Release-iphoneos/Teleprompter.app Payload/ && zip -r Teleprompter.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Teleprompter
+          path: Teleprompter.ipa

@@ -1,0 +1,21 @@
+name: Teleprompter
+options:
+  bundleIdPrefix: pl.klaudiamichnik
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  Teleprompter:
+    type: application
+    platform: iOS
+    sources: [Sources]
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: Teleprompter
+        UILaunchScreen: {}
+        UIBackgroundModes: [audio] # „Audio, AirPlay i Obraz w Obrazie” — wymagane przez PiP
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+    settings:
+      base:
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
